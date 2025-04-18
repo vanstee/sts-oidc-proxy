@@ -1,12 +1,11 @@
 package main
 
 import (
-	"crypto/x509"
-	"encoding/pem"
 	"log"
 	"net/http"
 	"os"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/vanstee/sts-irsa-proxy/internal/server"
 )
 
@@ -15,27 +14,17 @@ func main() {
 
 	clientID := "https://kubernetes.default.svc.cluster.local"
 
-	// TODO: verify this against jwks in well known configuration
-	privateKeyFile, err := os.ReadFile("private.key")
+	data, err := os.ReadFile("priv.json")
 	if err != nil {
-		log.Fatalf("failed reading private key file: %v", err)
+		log.Fatalf("failed to read priv.json: %v", err)
 	}
 
-	block, _ := pem.Decode(privateKeyFile)
-	if block == nil || block.Type != "RSA PRIVATE KEY" {
-		log.Fatalf("failed decoding private key: %v", err)
+	var jwk jose.JSONWebKey
+	if err := jwk.UnmarshalJSON(data); err != nil {
+		log.Fatalf("failed to unmarshal priv.json: %v", err)
 	}
 
-	privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		log.Fatalf("failed parsing private key: %v", err)
-	}
-
-	// TODO: fix this
-	keyID := "DEADBEEF"
-	alg := "RS256"
-
-	s, err := server.NewServer(issuerURL, clientID, privateKey, keyID, alg)
+	s, err := server.NewServer(issuerURL, clientID, &jwk)
 	if err != nil {
 		log.Fatalf("failed initializing server: %v", err)
 	}

@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -32,7 +31,7 @@ type Server struct {
 	Signer       jose.Signer
 }
 
-func NewServer(issuerURL string, clientID string, priv crypto.PrivateKey, keyID, alg string) (*Server, error) {
+func NewServer(issuerURL string, clientID string, jwk *jose.JSONWebKey) (*Server, error) {
 	ctx := context.Background()
 	ctx = oidc.InsecureIssuerURLContext(ctx, issuerURL) // TODO: remove this
 
@@ -48,18 +47,20 @@ func NewServer(issuerURL string, clientID string, priv crypto.PrivateKey, keyID,
 
 	verifier := provider.Verifier(oidcConfig)
 
-	key := jose.SigningKey{
-		Algorithm: jose.SignatureAlgorithm(alg),
-		Key:       priv,
+	if !jwk.Valid() {
+		return nil, fmt.Errorf("invalid jwk")
 	}
 
-	opts := &jose.SignerOptions{
-		ExtraHeaders: map[jose.HeaderKey]interface{}{
-			jose.HeaderKey("kid"): keyID,
-		},
+	if jwk.IsPublic() {
+		return nil, fmt.Errorf("jwk cannot be public for signing")
 	}
 
-	signer, err := jose.NewSigner(key, opts)
+	signingKey := jose.SigningKey{
+		Algorithm: jose.SignatureAlgorithm(jwk.Algorithm),
+		Key:       jwk,
+	}
+	opts := (&jose.SignerOptions{}).WithType("JWT")
+	signer, err := jose.NewSigner(signingKey, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed creating signer: %v", err)
 	}
