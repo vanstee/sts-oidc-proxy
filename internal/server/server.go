@@ -4,48 +4,68 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/vanstee/sts-irsa-proxy/internal/config"
 )
 
 var (
-	defaultProxyURL = MustParseURL("https://sts.amazonaws.com")
+	defaultSTSEndpoint = MustParseURL("https://sts.amazonaws.com")
 )
 
 type Server struct {
 	ReverseProxy *httputil.ReverseProxy
-	ProxyURL     *url.URL
-	IssuerURL    string
-	ClientID     string
+	STSEndpoint  string
 	Provider     *oidc.Provider
-	OIDCConfig   *oidc.Config
-	Verifier     *oidc.IDTokenVerifier
+	Verifiers    map[*oidc.IDTokenVerifier]*config.ConfigOIDCProvider
 	Signer       jose.Signer
 }
 
-func NewServer(issuerURL string, clientID string, jwk *jose.JSONWebKey) (*Server, error) {
+func NewServer(c *config.Config) (*Server, error) {
 	ctx := context.Background()
-	ctx = oidc.InsecureIssuerURLContext(ctx, issuerURL) // TODO: remove this
 
-	provider, err := oidc.NewProvider(ctx, issuerURL)
+	verifiers := map[*oidc.IDTokenVerifier]*config.ConfigOIDCProvider{}
+	for _, providerConfig := range c.OIDCProviders {
+		issuerURL := MustParseURL(providerConfig.IssuerURL)
+		if issuerURL.Scheme != "https" {
+			log.Printf("warning: oidc provider %s is configured with an insecure issuer url", providerConfig.IssuerURL)
+			ctx = oidc.InsecureIssuerURLContext(ctx, providerConfig.IssuerURL)
+		}
+
+		provider, err := oidc.NewProvider(ctx, providerConfig.IssuerURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create oidc provider for issuer url %s: %v", providerConfig.IssuerURL, err)
+		}
+
+		oidcConfig := &oidc.Config{
+			ClientID:        providerConfig.ClientID,
+			SkipIssuerCheck: providerConfig.SkipIssuerCheck,
+		}
+
+		verifier := provider.Verifier(oidcConfig)
+		verifiers[verifier] = &providerConfig
+	}
+
+	data, err := os.ReadFile(c.PrivateJWKPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read %s: %v", c.PrivateJWKPath, err)
 	}
 
-	oidcConfig := &oidc.Config{
-		ClientID:        clientID,
-		SkipIssuerCheck: true, // TODO: remove this
+	var jwk jose.JSONWebKey
+	if err := jwk.UnmarshalJSON(data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal %s: %v", c.PrivateJWKPath, err)
 	}
-
-	verifier := provider.Verifier(oidcConfig)
 
 	if !jwk.Valid() {
 		return nil, fmt.Errorf("invalid jwk")
@@ -66,13 +86,9 @@ func NewServer(issuerURL string, clientID string, jwk *jose.JSONWebKey) (*Server
 	}
 
 	server := &Server{
-		ProxyURL:   defaultProxyURL,
-		IssuerURL:  issuerURL,
-		ClientID:   clientID,
-		Provider:   provider,
-		OIDCConfig: oidcConfig,
-		Verifier:   verifier,
-		Signer:     signer,
+		STSEndpoint: c.STSEndpoint,
+		Verifiers:   verifiers,
+		Signer:      signer,
 	}
 
 	server.ReverseProxy = &httputil.ReverseProxy{
@@ -109,9 +125,22 @@ func (s *Server) Rewrite(r *httputil.ProxyRequest) {
 		return
 	}
 
-	token, err := s.Verifier.Verify(ctx, tokenString)
-	if err != nil {
-		log.Printf("failed to verify token: %v", err)
+	var token *oidc.IDToken
+	var providerConfig *config.ConfigOIDCProvider
+	var errs []error
+	for verifier, config := range s.Verifiers {
+		t, err := verifier.Verify(ctx, tokenString)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		token = t
+		providerConfig = config
+		break
+	}
+	if token == nil {
+		log.Printf("failed to verify token: %v", errors.Join(errs...))
 		return
 	}
 
@@ -121,8 +150,9 @@ func (s *Server) Rewrite(r *httputil.ProxyRequest) {
 		return
 	}
 
-	// TODO: verify audience is sts.amazonaws.com
-	// TODO: consider updating sub to <cluster>/system:serviceaccount:<namespace>:<serviceaccount>
+	if providerConfig.RewriteSubject {
+		claims.Subject = providerConfig.ClusterName + "/" + claims.Subject
+	}
 
 	marshalledClaims, err := json.Marshal(claims)
 	if err != nil {
@@ -142,11 +172,16 @@ func (s *Server) Rewrite(r *httputil.ProxyRequest) {
 		return
 	}
 
+	r.SetURL(MustParseURL(s.STSEndpoint))
+
+	// reset in request body to satisfy Rewrite requirements
+	r.In.Body = io.NopCloser(&buf)
+
 	form := r.In.Form
 	form.Set("WebIdentityToken", jwt)
-
-	r.SetURL(s.ProxyURL)
-	r.Out.Body = io.NopCloser(&buf)
+	body := form.Encode()
+	r.Out.ContentLength = int64(len(body))
+	r.Out.Body = io.NopCloser(strings.NewReader(body))
 }
 
 func MustParseURL(rawUrl string) *url.URL {

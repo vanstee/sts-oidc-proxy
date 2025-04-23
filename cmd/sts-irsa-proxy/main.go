@@ -3,28 +3,19 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
 
-	"github.com/go-jose/go-jose/v4"
+	"github.com/vanstee/sts-irsa-proxy/internal/config"
 	"github.com/vanstee/sts-irsa-proxy/internal/server"
 )
 
 func main() {
-	issuerURL := "http://localhost:8000"
-
-	clientID := "https://kubernetes.default.svc.cluster.local"
-
-	data, err := os.ReadFile("priv.json")
+	configPath := "config.yaml"
+	c, err := config.ParseFile("config.yaml")
 	if err != nil {
-		log.Fatalf("failed to read priv.json: %v", err)
+		log.Fatalf("failed to read config at path %s: %v", configPath, err)
 	}
 
-	var jwk jose.JSONWebKey
-	if err := jwk.UnmarshalJSON(data); err != nil {
-		log.Fatalf("failed to unmarshal priv.json: %v", err)
-	}
-
-	s, err := server.NewServer(issuerURL, clientID, &jwk)
+	s, err := server.NewServer(c)
 	if err != nil {
 		log.Fatalf("failed initializing server: %v", err)
 	}
