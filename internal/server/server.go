@@ -17,6 +17,7 @@ import (
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
+
 	"github.com/vanstee/sts-irsa-proxy/internal/config"
 )
 
@@ -127,7 +128,7 @@ func (s *Server) Rewrite(r *httputil.ProxyRequest) {
 
 	var token *oidc.IDToken
 	var providerConfig *config.ConfigOIDCProvider
-	var errs []error
+	errs := []error{}
 	for verifier, config := range s.Verifiers {
 		t, err := verifier.Verify(ctx, tokenString)
 		if err != nil {
@@ -172,14 +173,14 @@ func (s *Server) Rewrite(r *httputil.ProxyRequest) {
 		return
 	}
 
-	r.SetURL(MustParseURL(s.STSEndpoint))
-
 	// reset in request body to satisfy Rewrite requirements
 	r.In.Body = io.NopCloser(&buf)
 
 	form := r.In.Form
 	form.Set("WebIdentityToken", jwt)
 	body := form.Encode()
+
+	r.Out.URL = MustParseURL(s.STSEndpoint)
 	r.Out.ContentLength = int64(len(body))
 	r.Out.Body = io.NopCloser(strings.NewReader(body))
 }
